@@ -27,10 +27,6 @@
 #define DSL_TEST_NONE		0
 #define DSL_TEST_INTERNAL	1
 
-/* --- Buffer option values (fork SR_BUF_* not in upstream) --- */
-#define DSL_BUF_STOP		0
-#define DSL_BUF_UPLOAD		1
-
 /* ===========================================================================
  * 1. Profile table — 25 devices (14 DSLogic + 11 DSCope)
  *    Data copied from old dsl.h supported_DSLogic[] + supported_DSCope[].
@@ -772,10 +768,15 @@ static const uint32_t drvopts[] = {
 static const uint32_t devopts[] = {
 	SR_CONF_CONN | SR_CONF_GET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
-	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_CONTINUOUS | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
+	SR_CONF_TRIGGER_POS | SR_CONF_GET,
+	SR_CONF_TRIGGER_ADV_MODE | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_ADV_ENABLE | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_ADV_STAGES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_ADV_CONFIG | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_CAPTUREFILE | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_NUM_HDIV | SR_CONF_GET,
 	SR_CONF_NUM_VDIV | SR_CONF_GET,
@@ -786,7 +787,7 @@ static const uint32_t devopts[] = {
 	SR_CONF_BUFFER_OPTIONS | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_CHANNEL_MODE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
-	SR_CONF_VTH | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_VTH | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_FILTER | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_MAX_HEIGHT | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_MAX_HEIGHT_VALUE | SR_CONF_GET,
@@ -1318,14 +1319,18 @@ static int dev_open(struct sr_dev_inst *sdi)
 	if (devc->cur_samplerate == 0)
 		devc->cur_samplerate = devc->profile->dev_caps.default_samplerate;
 
-	if (devc->vth == 0.0) {
-		devc->vth = thresholds[1][0];
+	if (devc->profile->dev_caps.feature_caps & CAPS_FEATURE_VTH) {
 		ret = dslogic_set_voltage_threshold(sdi, devc->vth);
-		if (ret != SR_OK)
-			return ret;
+		if (ret != SR_OK) goto open_failed;
 	}
-
+	if (devc->profile->dev_caps.feature_caps & CAPS_FEATURE_ADF4360) {
+		ret = dsl_config_adc(sdi, adc_clk_init_500m);
+		if (ret != SR_OK) goto open_failed;
+	}
 	return SR_OK;
+open_failed:
+	dsl_dev_close(sdi);
+	return ret;
 }
 
 /* ===========================================================================
@@ -1333,19 +1338,38 @@ static int dev_open(struct sr_dev_inst *sdi)
  * =========================================================================== */
 static int dev_close(struct sr_dev_inst *sdi)
 {
-	struct sr_usb_dev_inst *usb;
+	return dsl_dev_close(sdi);
+}
 
-	usb = sdi->conn;
+static int dev_clear(const struct sr_dev_driver *di)
+{
+	struct drv_context *drvc = di->context;
+	GSList *l;
+	if (!drvc) return SR_OK;
+	/* std_dev_clear ignores dev_close errors. Preflight all cancellations
+	 * so no callback-owned device can be freed on a drain timeout. */
+	for (l = drvc->instances; l; l = l->next)
+		if (dsl_drain_transfers(l->data) != SR_OK) return SR_ERR;
+	return std_dev_clear(di);
+}
 
-	if (!usb->devhdl)
-		return SR_ERR_BUG;
+static int cleanup(const struct sr_dev_driver *di)
+{
+	int ret = dev_clear(di);
+	if (ret == SR_OK) g_free(di->context);
+	return ret;
+}
 
-	sr_info("Closing device on %d.%d (logical) / %s (physical) interface %d.",
-		usb->bus, usb->address, sdi->connection_id, USB_INTERFACE);
-	libusb_release_interface(usb->devhdl, USB_INTERFACE);
-	libusb_close(usb->devhdl);
-	usb->devhdl = NULL;
-
+static int config_channel_set(const struct sr_dev_inst *sdi,
+	struct sr_channel *ch, unsigned int changes)
+{
+	struct dev_context *devc = sdi->priv;
+	if (changes != SR_CHANNEL_SET_ENABLED) return SR_ERR_NA;
+	if (devc->submitted_transfers || devc->source_added) {
+		/* device.c sets enabled before calling us and does not roll back. */
+		ch->enabled = !!(devc->capture_channel_mask & (UINT32_C(1) << ch->index));
+		return SR_ERR;
+	}
 	return SR_OK;
 }
 
@@ -1367,6 +1391,16 @@ static int config_get(uint32_t key, GVariant **data,
 	ch = (cg && cg->channels) ? cg->channels->data : NULL;
 
 	switch (key) {
+	case SR_CONF_TRIGGER_POS:
+		*data = g_variant_new_uint64(devc->trigger_pos); break;
+	case SR_CONF_TRIGGER_ADV_MODE:
+		*data = g_variant_new_byte(devc->adv_mode); break;
+	case SR_CONF_TRIGGER_ADV_ENABLE:
+		*data = g_variant_new_boolean(devc->adv_enabled); break;
+	case SR_CONF_TRIGGER_ADV_STAGES:
+		*data = g_variant_new_byte(devc->adv_stages); break;
+	case SR_CONF_TRIGGER_ADV_CONFIG:
+		*data = g_variant_new_string(devc->adv_config); break;
 	case SR_CONF_CONN:
 		if (!sdi->conn)
 			return SR_ERR_ARG;
@@ -1425,7 +1459,8 @@ static int config_get(uint32_t key, GVariant **data,
 		*data = g_variant_new_boolean(devc->rle_mode);
 		break;
 	case SR_CONF_RLE_SUPPORT:
-		*data = g_variant_new_boolean(devc->rle_support);
+		*data = g_variant_new_boolean(devc->mode == DSL_MODE_LOGIC &&
+			devc->rle_support && devc->test_mode == DSL_TEST_NONE);
 		break;
 	case SR_CONF_STREAM:
 		*data = g_variant_new_boolean(devc->stream);
@@ -1529,7 +1564,12 @@ static int config_get(uint32_t key, GVariant **data,
 		}
 		break;
 	case SR_CONF_WAIT_UPLOAD:
-		*data = g_variant_new_boolean(FALSE);
+		if (!devc->stream && devc->buf_options == DSL_BUF_UPLOAD && devc->status == DSL_START) {
+			int ret = dsl_wr_reg(sdi, CTR0_ADDR, bmFORCE_STOP);
+			if (ret != SR_OK) return ret;
+			devc->status = DSL_ABORT;
+		}
+		*data = g_variant_new_boolean(devc->status == DSL_ABORT);
 		break;
 	case SR_CONF_BANDWIDTH_LIMIT:
 		*data = g_variant_new_string(bandwidth_strs[devc->bw_limit]);
@@ -1639,11 +1679,35 @@ static int config_set(uint32_t key, GVariant *data,
 	devc = sdi->priv;
 	ch = (cg && cg->channels) ? cg->channels->data : NULL;
 
+	if (devc->submitted_transfers || devc->source_added) return SR_ERR;
 	switch (key) {
+	case SR_CONF_TRIGGER_ADV_MODE:
+		if (g_variant_get_byte(data) > 2) return SR_ERR_ARG;
+		devc->adv_mode = g_variant_get_byte(data); break;
+	case SR_CONF_TRIGGER_ADV_ENABLE:
+		devc->adv_enabled = g_variant_get_boolean(data); break;
+	case SR_CONF_TRIGGER_ADV_STAGES:
+		if (!g_variant_get_byte(data) || g_variant_get_byte(data) > 16) return SR_ERR_ARG;
+		devc->adv_stages = g_variant_get_byte(data); break;
+	case SR_CONF_TRIGGER_ADV_CONFIG:
+	{
+		struct dsl_adv_trigger parsed;
+		const char *text = g_variant_get_string(data, NULL);
+		if (!dsl_trigger_parse(text, MAX(channel_modes[devc->ch_mode].num, 16), &parsed))
+			return SR_ERR_ARG;
+		g_strlcpy(devc->adv_config, text, sizeof(devc->adv_config));
+		devc->adv_trigger = parsed;
+		devc->adv_valid = TRUE;
+		devc->capture_ratio = parsed.position;
+		break;
+	}
 	case SR_CONF_SAMPLERATE:
 	{
 		unsigned int n = u64_array_count(devc->profile->dev_caps.samplerates);
 		if ((idx = std_u64_idx(data, devc->profile->dev_caps.samplerates, n)) < 0)
+			return SR_ERR_ARG;
+		if (devc->profile->dev_caps.samplerates[idx] < channel_modes[devc->ch_mode].min_samplerate ||
+			devc->profile->dev_caps.samplerates[idx] > channel_modes[devc->ch_mode].max_samplerate)
 			return SR_ERR_ARG;
 		devc->cur_samplerate = devc->profile->dev_caps.samplerates[idx];
 		if (devc->test_mode == DSL_TEST_NONE && devc->mode != DSL_MODE_LOGIC)
@@ -1651,19 +1715,26 @@ static int config_set(uint32_t key, GVariant *data,
 		break;
 	}
 	case SR_CONF_LIMIT_SAMPLES:
+		if (!g_variant_get_uint64(data) || g_variant_get_uint64(data) > DSL_MAX_LOGIC_SAMPLES)
+			return SR_ERR_ARG;
 		devc->limit_samples = g_variant_get_uint64(data);
 		break;
 	case SR_CONF_CAPTURE_RATIO:
+		if (g_variant_get_uint64(data) > 100) return SR_ERR_ARG;
 		devc->capture_ratio = g_variant_get_uint64(data);
 		break;
 	case SR_CONF_CONTINUOUS:
-		devc->continuous_mode = g_variant_get_boolean(data);
+	case SR_CONF_STREAM:
+	{
+		GVariant *mode_data = g_variant_ref_sink(g_variant_new_string(
+			opmode_strs[g_variant_get_boolean(data) ? LO_OP_STREAM : LO_OP_BUFFER]));
+		ret = config_set(SR_CONF_OPERATION_MODE, mode_data, sdi, cg);
+		g_variant_unref(mode_data);
 		break;
+	}
 	case SR_CONF_EXTERNAL_CLOCK:
-		devc->external_clock = g_variant_get_boolean(data);
-		break;
 	case SR_CONF_CLOCK_TYPE:
-		devc->clock_type = g_variant_get_boolean(data);
+		devc->external_clock = devc->clock_type = g_variant_get_boolean(data);
 		break;
 	case SR_CONF_CLOCK_EDGE:
 		/* Accept string from config_list dropdown. Validate via std_str_idx
@@ -1676,7 +1747,8 @@ static int config_set(uint32_t key, GVariant *data,
 		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(opmode_strs))) < 0)
 			return SR_ERR_ARG;
 		nv = idx;
-		if (devc->mode == DSL_MODE_LOGIC && devc->op_mode != nv) {
+		if (devc->mode != DSL_MODE_LOGIC || nv > LO_OP_INTEST) return SR_ERR_NA;
+		if (devc->op_mode != nv) {
 			if (nv == LO_OP_BUFFER) {
 				devc->op_mode = LO_OP_BUFFER;
 				devc->test_mode = DSL_TEST_NONE;
@@ -1709,7 +1781,10 @@ static int config_set(uint32_t key, GVariant *data,
 			} else {
 				ret = SR_ERR;
 			}
-			dsl_adjust_probes(sdi, channel_modes[devc->ch_mode].num);
+			devc->continuous_mode = devc->stream;
+			if (devc->test_mode != DSL_TEST_NONE) devc->rle_mode = FALSE;
+			ret = dsl_adjust_probes((struct sr_dev_inst *)sdi, channel_modes[devc->ch_mode].num);
+			if (ret != SR_OK) return ret;
 			dsl_adjust_samplerate(devc);
 			if (devc->op_mode == LO_OP_INTEST) {
 				devc->cur_samplerate = devc->stream ?
@@ -1731,13 +1806,14 @@ static int config_set(uint32_t key, GVariant *data,
 	case SR_CONF_CHANNEL_MODE:
 	{
 		const char *str = g_variant_get_string(data, NULL);
+		ret = SR_ERR_ARG;
 		if (devc->mode == DSL_MODE_LOGIC) {
 			for (i = 0; i < ARRAY_SIZE(channel_modes); i++) {
 				if ((devc->profile->dev_caps.channels & (1ULL << i)) &&
 				    channel_modes[i].stream == devc->stream &&
 				    !strcmp(str, channel_modes[i].descr)) {
 					devc->ch_mode = channel_modes[i].id;
-					dsl_adjust_probes(sdi, channel_modes[devc->ch_mode].num);
+					ret = dsl_adjust_probes((struct sr_dev_inst *)sdi, channel_modes[devc->ch_mode].num);
 					dsl_adjust_samplerate(devc);
 					break;
 				}
@@ -1746,6 +1822,7 @@ static int config_set(uint32_t key, GVariant *data,
 		break;
 	}
 	case SR_CONF_THRESHOLD:
+		if (devc->profile->dev_caps.feature_caps & CAPS_FEATURE_VTH) return SR_ERR_NA;
 		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(threshold_strs))) < 0)
 			return SR_ERR_ARG;
 		nv = idx;
@@ -1758,8 +1835,7 @@ static int config_set(uint32_t key, GVariant *data,
 		}
 		break;
 	case SR_CONF_VTH:
-		devc->vth = g_variant_get_double(data);
-		ret = dslogic_set_voltage_threshold(sdi, devc->vth);
+		ret = dslogic_set_voltage_threshold(sdi, g_variant_get_double(data));
 		break;
 	case SR_CONF_VOLTAGE_THRESHOLD:
 		if (!strcmp(devc->profile->model, "DSLogic")) {
@@ -1769,8 +1845,9 @@ static int config_set(uint32_t key, GVariant *data,
 			ret = dslogic_fpga_firmware_upload(sdi);
 		} else {
 			g_variant_get(data, "(dd)", &low, &high);
-			devc->vth = (low + high) / 2.0;
-			ret = dslogic_set_voltage_threshold(sdi, devc->vth);
+			if (!isfinite(low) || !isfinite(high) || low > high || low < 0 || high > 5)
+				return SR_ERR_ARG;
+			ret = dslogic_set_voltage_threshold(sdi, (low + high) / 2.0);
 		}
 		break;
 	case SR_CONF_FILTER:
@@ -1784,10 +1861,14 @@ static int config_set(uint32_t key, GVariant *data,
 		devc->max_height = idx;
 		break;
 	case SR_CONF_RLE:
+		if (g_variant_get_boolean(data) && (devc->mode != DSL_MODE_LOGIC ||
+			!devc->rle_support || devc->test_mode != DSL_TEST_NONE)) return SR_ERR_NA;
 		devc->rle_mode = g_variant_get_boolean(data);
 		break;
 	case SR_CONF_RLE_SUPPORT:
+		if (devc->mode != DSL_MODE_LOGIC) return SR_ERR_NA;
 		devc->rle_support = g_variant_get_boolean(data);
+		if (!devc->rle_support) devc->rle_mode = FALSE;
 		break;
 	case SR_CONF_INSTANT:
 		devc->instant = g_variant_get_boolean(data);
@@ -1803,6 +1884,11 @@ static int config_set(uint32_t key, GVariant *data,
 	case SR_CONF_DEVICE_MODE:
 	{
 		int new_mode = g_variant_get_int16(data);
+		if (new_mode < DSL_MODE_LOGIC || new_mode > DSL_MODE_ANALOG ||
+			!(devc->profile->dev_caps.mode_caps & (new_mode == DSL_MODE_LOGIC ? CAPS_MODE_LOGIC :
+			new_mode == DSL_MODE_DSO ? CAPS_MODE_DSO : CAPS_MODE_ANALOG)))
+			return SR_ERR_NA;
+		if (new_mode == devc->mode) return SR_OK;
 		num_probes = 0;
 		devc->mode = new_mode;
 		if (new_mode == DSL_MODE_LOGIC) {
@@ -1854,7 +1940,7 @@ static int config_set(uint32_t key, GVariant *data,
 			ret = SR_ERR;
 		}
 		if (num_probes > 0)
-			dsl_setup_probes(sdi, num_probes);
+			ret = dsl_setup_probes((struct sr_dev_inst *)sdi, num_probes);
 		/* Send full DSO configuration after mode switch to DSO/ANALOG. */
 		if (new_mode != DSL_MODE_LOGIC && num_probes > 0)
 			dslogic_dso_init(sdi);
@@ -1862,9 +1948,6 @@ static int config_set(uint32_t key, GVariant *data,
 	}
 	case SR_CONF_LOOP_MODE:
 		devc->is_loop = g_variant_get_boolean(data);
-		break;
-	case SR_CONF_STREAM:
-		devc->stream = g_variant_get_boolean(data);
 		break;
 	case SR_CONF_TIMEBASE:
 		devc->timebase = g_variant_get_uint64(data);
@@ -2038,18 +2121,29 @@ static int config_list(uint32_t key, GVariant **data,
 	{
 		GVariantBuilder gvb;
 		GVariant *gvar;
-		unsigned int n;
+		GVariantBuilder rates;
 		if (!devc || !devc->profile)
 			return SR_ERR_ARG;
-		n = u64_array_count(devc->profile->dev_caps.samplerates);
+		g_variant_builder_init(&rates, G_VARIANT_TYPE("at"));
+		for (i = 0; devc->profile->dev_caps.samplerates[i]; i++) {
+			uint64_t rate = devc->profile->dev_caps.samplerates[i];
+			if (rate >= channel_modes[devc->ch_mode].min_samplerate &&
+				rate <= channel_modes[devc->ch_mode].max_samplerate)
+				g_variant_builder_add(&rates, "t", rate);
+		}
 		g_variant_builder_init(&gvb, G_VARIANT_TYPE("a{sv}"));
-		gvar = g_variant_new_from_data(G_VARIANT_TYPE("at"),
-			devc->profile->dev_caps.samplerates,
-			n * sizeof(uint64_t), TRUE, NULL, NULL);
+		gvar = g_variant_builder_end(&rates);
 		g_variant_builder_add(&gvb, "{sv}", "samplerates", gvar);
 		*data = g_variant_builder_end(&gvb);
 		break;
 	}
+	case SR_CONF_LIMIT_SAMPLES:
+		*data = std_gvar_tuple_u64(UINT64_C(1), DSL_MAX_LOGIC_SAMPLES);
+		break;
+	case SR_CONF_VTH:
+		if (!devc || !(devc->profile->dev_caps.feature_caps & CAPS_FEATURE_VTH)) return SR_ERR_NA;
+		*data = g_variant_new("(dd)", 0.0, 5.0);
+		break;
 	case SR_CONF_VOLTAGE_THRESHOLD:
 		if (!devc || !devc->profile)
 			return SR_ERR_ARG;
@@ -2186,10 +2280,11 @@ static struct sr_dev_driver dreamsourcelab_dslogic_driver_info = {
 	.longname = "DreamSourceLab DSLogic/DSCope",
 	.api_version = 1,
 	.init = std_init,
-	.cleanup = std_cleanup,
+	.cleanup = cleanup,
 	.scan = scan,
 	.dev_list = std_dev_list,
-	.dev_clear = std_dev_clear,
+	.dev_clear = dev_clear,
+	.config_channel_set = config_channel_set,
 	.config_get = config_get,
 	.config_set = config_set,
 	.config_list = config_list,

@@ -28,13 +28,15 @@ SR_PRIV int command_ctl_wr(libusb_device_handle *devhdl, struct ctl_wr_cmd cmd)
 {
 	int ret;
 
-	assert(devhdl);
+	if (!devhdl || cmd.header.size > sizeof(cmd.data))
+		return SR_ERR_ARG;
+	cmd.header.offset = GUINT16_TO_LE(cmd.header.offset);
 
 	/* Send the control command. */
 	ret = libusb_control_transfer(devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
 			LIBUSB_ENDPOINT_OUT, CMD_CTL_WR, 0x0000, 0x0000,
 			(unsigned char *)&cmd, cmd.header.size+sizeof(struct ctl_header), 3000);
-	if (ret < 0) {
+	if (ret != cmd.header.size + (int)sizeof(struct ctl_header)) {
 		sr_err("Unable to send CMD_CTL_WR command(dest:%d/offset:%d/size:%d): %s.",
 		       cmd.header.dest, cmd.header.offset, cmd.header.size,
 		       libusb_error_name(ret));
@@ -48,13 +50,15 @@ SR_PRIV int command_ctl_rd(libusb_device_handle *devhdl, struct ctl_rd_cmd cmd)
 {
 	int ret;
 
-	assert(devhdl);
+	if (!devhdl || (cmd.header.size && !cmd.data))
+		return SR_ERR_ARG;
+	cmd.header.offset = GUINT16_TO_LE(cmd.header.offset);
 
 	/* Send the control message. */
 	ret = libusb_control_transfer(devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
 			LIBUSB_ENDPOINT_OUT, CMD_CTL_RD_PRE, 0x0000, 0x0000,
 			(unsigned char *)&cmd, sizeof(struct ctl_header), 3000);
-	if (ret < 0) {
+	if (ret != sizeof(struct ctl_header)) {
 		sr_err("Unable to send CMD_CTL_RD_PRE command(dest:%d/offset:%d/size:%d): %s.",
 		       cmd.header.dest, cmd.header.offset, cmd.header.size,
 		       libusb_error_name(ret));
@@ -68,7 +72,7 @@ SR_PRIV int command_ctl_rd(libusb_device_handle *devhdl, struct ctl_rd_cmd cmd)
 		LIBUSB_ENDPOINT_IN, CMD_CTL_RD, 0x0000, 0x0000,
 		(unsigned char *)cmd.data, cmd.header.size, 3000);
 
-	if (ret < 0) {
+	if (ret != cmd.header.size) {
 		sr_err("Unable to send CMD_CTL_RD command: %s.",
 		       libusb_error_name(ret));
 		return SR_ERR;

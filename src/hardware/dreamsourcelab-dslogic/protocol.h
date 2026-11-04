@@ -38,6 +38,8 @@
 #include <sys/stat.h>
 
 #include "command.h"
+#include "logic.h"
+#include "trigger.h"
 
 #define LOG_PREFIX "dreamsourcelab-dslogic"
 
@@ -49,6 +51,8 @@
 
 #define NUM_CHANNELS		16
 #define NUM_TRIGGER_STAGES	16
+#define DSL_BUF_STOP 0
+#define DSL_BUF_UPLOAD 1
 
 #define DSL_REQUIRED_VERSION_MAJOR	2
 #define DSL_REQUIRED_VERSION_MINOR	0
@@ -97,6 +101,8 @@
 #define CAPS_FEATURE_SECURITY		(1 << 14)	/* security check */
 
 /* --- Atomic sample constants --- */
+/* 32-bit capture counter counts groups of 16, aligned to 64 samples. */
+#define DSL_MAX_LOGIC_SAMPLES (UINT64_C(0xffffffff) * 16 & ~UINT64_C(63))
 #define DSLOGIC_ATOMIC_BITS		6
 #define DSLOGIC_ATOMIC_SAMPLES		(1 << DSLOGIC_ATOMIC_BITS)
 #define DSLOGIC_ATOMIC_SIZE		(1 << (DSLOGIC_ATOMIC_BITS - 3))
@@ -774,7 +780,17 @@ struct dev_context {
 	gboolean external_clock;
 	gboolean continuous_mode;
 	struct sr_context *ctx;
-	uint16_t *deinterleave_buffer;
+	uint8_t *deinterleave_buffer;
+	struct dsl_logic_decoder decoder;
+	uint32_t capture_channel_mask;
+	unsigned int sample_unitsize, capture_channel_count;
+	gboolean trigger_pending;
+	gboolean source_added;
+	gboolean header_sent;
+	uint8_t adv_mode, adv_stages;
+	gboolean adv_enabled, adv_valid;
+	struct dsl_adv_trigger adv_trigger;
+	char adv_config[16385];
 	/* Pattern mode for DSO/ANALOG waveform selection (GUI compat — stored
 	 * as a string index but the actual waveform comes from the hardware,
 	 * so this is a no-op for real devices. Mirrors demo driver's enum. */
@@ -869,6 +885,7 @@ SR_PRIV int dsl_config_list(uint32_t key, GVariant **data, const struct sr_dev_i
 
 SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboolean *fpga_done);
 SR_PRIV int dsl_dev_close(struct sr_dev_inst *sdi);
+SR_PRIV int dsl_drain_transfers(const struct sr_dev_inst *sdi);
 SR_PRIV int dsl_dev_acquisition_stop(const struct sr_dev_inst *sdi, void *cb_data);
 SR_PRIV int dsl_dev_status_get(const struct sr_dev_inst *sdi, struct dsl_status *status, gboolean prg);
 
