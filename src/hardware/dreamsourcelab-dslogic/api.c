@@ -1013,10 +1013,9 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	gboolean has_firmware;
 	struct libusb_device_descriptor des;
 	libusb_device **devlist;
-	struct libusb_device_handle *hdl;
-	int ret, i, j;
+	int i, j;
 	const char *conn;
-	char manufacturer[64], product[64], serial_num[64], connection_id[64];
+	char serial_num[64], connection_id[64];
 	char channel_name[16];
 	enum libusb_speed usb_speed;
 	struct dsl_channel_priv *ch_priv;
@@ -1065,44 +1064,13 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		if (!is_plausible(&des, usb_speed))
 			continue;
 
-		if ((ret = libusb_open(devlist[i], &hdl)) < 0) {
-			sr_warn("Failed to open potential device with "
-				"VID:PID %04x:%04x: %s.", des.idVendor,
-				des.idProduct, libusb_error_name(ret));
-			continue;
-		}
-
-		if (des.iManufacturer == 0) {
-			manufacturer[0] = '\0';
-		} else if ((ret = libusb_get_string_descriptor_ascii(hdl,
-				des.iManufacturer, (unsigned char *)manufacturer,
-				sizeof(manufacturer))) < 0) {
-			sr_warn("Failed to get manufacturer string descriptor: %s.",
-				libusb_error_name(ret));
-			continue;
-		}
-
-		if (des.iProduct == 0) {
-			product[0] = '\0';
-		} else if ((ret = libusb_get_string_descriptor_ascii(hdl,
-				des.iProduct, (unsigned char *)product,
-				sizeof(product))) < 0) {
-			sr_warn("Failed to get product string descriptor: %s.",
-				libusb_error_name(ret));
-			continue;
-		}
-
-		if (des.iSerialNumber == 0) {
-			serial_num[0] = '\0';
-		} else if ((ret = libusb_get_string_descriptor_ascii(hdl,
-				des.iSerialNumber, (unsigned char *)serial_num,
-				sizeof(serial_num))) < 0) {
-			sr_warn("Failed to get serial number string descriptor: %s.",
-				libusb_error_name(ret));
-			continue;
-		}
-
-		libusb_close(hdl);
+		/* Do not open the device or read USB string descriptors from scan().
+		 * Those synchronous control transfers can block indefinitely on Windows
+		 * when a DreamSourceLab interface is claimed/reset. scan() runs on the
+		 * PXView/UI thread, so one stalled descriptor request freezes the GUI.
+		 * VID/PID/speed already selected a profile; strings are optional metadata
+		 * and are intentionally deferred to the open path. */
+		serial_num[0] = '\0';
 
 		if (usb_get_port_path(devlist[i], connection_id, sizeof(connection_id)) < 0)
 			continue;
@@ -1174,29 +1142,12 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			cg->channels = g_slist_append(cg->channels, ch);
 		}
 
-		/* Check if firmware is already loaded.
-		 *
-		 * Two product strings must be accepted; testing only one is what
-		 * made every already-flashed device look unflashed. See the
-		 * DSL_PROD_STRING_* definitions in protocol.h for how each was
-		 * established (the DreamSourceLab one is decoded straight out of
-		 * the shipped .fw blobs).
-		 *
-		 * The comparison is strcmp-derived (usb_match_manuf_prod() in
-		 * usb.c), i.e. exact -- it does NOT prefix-match, so the shorter
-		 * upstream string does not subsume the DreamSourceLab one. */
-		has_firmware = usb_match_manuf_prod(devlist[i],
-			DSL_MANUF_STRING, DSL_PROD_STRING_DSVIEW);
-		if (!has_firmware)
-			has_firmware = usb_match_manuf_prod(devlist[i],
-				DSL_MANUF_STRING, DSL_PROD_STRING_UPSTREAM);
-		/* Fall back to the fork's own probe. Unlike usb_match_manuf_prod()
-		 * this one reports TRUE when the handle cannot be opened at all
-		 * ("maybe the device is busy; assume it matches"), which keeps a
-		 * device that is temporarily claimed by something else from being
-		 * misdiagnosed as unflashed and re-flashed. */
-		if (!has_firmware)
-			has_firmware = dsl_check_conf_profile(devlist[i]);
+		/* Do not probe firmware strings during scan(). A known VID/PID/speed
+		 * profile is enough to publish the device; string-descriptor probing
+		 * is synchronous and can wedge the UI thread on a claimed/reset
+		 * DreamSourceLab interface. dev_open() performs the real initialization
+		 * and reports failures without blocking the device-list refresh. */
+		has_firmware = TRUE;
 
 		if (has_firmware) {
 			sr_dbg("Found a DSLogic/DSCope device.");
