@@ -994,7 +994,6 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 {
 	const size_t size = get_buffer_size(sdi);
 	const unsigned int num_transfers = get_number_of_transfers(sdi);
-	const unsigned int timeout = get_timeout(sdi);
 
 	struct dev_context *devc;
 	struct sr_usb_dev_inst *usb;
@@ -1058,7 +1057,11 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 	devc->transfers[0] = transfer;
 	devc->submitted_transfers++;
 
-	/* Slots 1..N: sample data. */
+	/* Slots 1..N: sample data. Like the DSL reference, leave reads pending
+	 * until data arrives or acquisition is explicitly stopped. A buffered
+	 * trigger or slow stream can wait longer than the queue's time span;
+	 * on WinUSB, timing out a queued read can abort endpoint 6 and cancel
+	 * the status header too. get_timeout() is only the event poll interval. */
 	for (i = 0; i < num_transfers; i++) {
 		if (!(buf = g_try_malloc(size))) {
 			sr_err("USB transfer buffer malloc failed.");
@@ -1073,7 +1076,7 @@ static int start_transfers(const struct sr_dev_inst *sdi)
 		}
 		libusb_fill_bulk_transfer(transfer, usb->devhdl,
 				6 | LIBUSB_ENDPOINT_IN, buf, size,
-				receive_transfer, (void *)sdi, timeout);
+				receive_transfer, (void *)sdi, 0);
 		sr_info("submitting transfer: %d", i);
 		if ((ret = libusb_submit_transfer(transfer)) != 0) {
 			sr_err("Failed to submit transfer: %s.",

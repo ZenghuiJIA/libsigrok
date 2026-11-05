@@ -337,6 +337,47 @@ static void test_start_lifetime(void)
 	}
 	dispose_device(&s);
 }
+static void test_long_header_wait(void)
+{
+	int stream, i, timed_out;
+	for (stream = 0; stream <= 1; stream++) {
+		struct sr_dev_inst s; struct dev_context d; struct sr_usb_dev_inst u;
+		struct sr_context ctx = {0}; struct drv_context dc = {0};
+		struct sr_dev_driver di = {0}; struct libusb_transfer *t;
+		struct dsl_trigger_pos *p;
+		reset_mock(); init_device(&s, &d, &u);
+		g_free(d.deinterleave_buffer); d.deinterleave_buffer = NULL;
+		dc.sr_ctx = &ctx; di.context = &dc; s.driver = &di;
+		d.stream = stream; d.cur_samplerate = SR_MHZ(1);
+		if (stream) d.ch_mode = DSL_STREAM50x32;
+		assert(dslogic_acquisition_start(&s) == SR_OK);
+		/* Model WinUSB endpoint-wide cancellation when a queued read times
+		 * out before the status header arrives. One second without data is
+		 * legitimate for a buffered trigger or a slow stream startup. */
+		timed_out = 0;
+		for (i = 0; i < 128; i++)
+			if (queued[i] && queued[i]->timeout && queued[i]->timeout <= 1000)
+				timed_out = 1;
+		if (timed_out)
+			for (i = 0; i < 128; i++)
+				if (queued[i]) queued[i]->status = LIBUSB_TRANSFER_CANCELLED;
+		{ struct timeval tv = {0, 0}; libusb_handle_events_timeout(NULL, &tv); }
+		assert(d.status == DSL_START && d.submitted_transfers && !ends);
+		/* The eventual header and data must still complete this capture. */
+		t = queued[0]; queued[0] = NULL; p = (void *)t->buffer;
+		memset(p, 0, t->length); WL32(&p->check_id, TRIG_CHECKID);
+		WL32(&p->status, 1); t->actual_length = t->length;
+		t->status = LIBUSB_TRANSFER_COMPLETED; t->callback(t);
+		t = queued[1]; queued[1] = NULL;
+		memset(t->buffer, 0xff, t->length); t->actual_length = t->length;
+		t->status = LIBUSB_TRANSFER_COMPLETED; t->callback(t);
+		assert(result_samples == 128);
+		assert(dsl_drain_transfers(&s) == SR_OK);
+		assert(headers == 1 && ends == 1 && triggers == 1);
+		assert(!d.transfers && !d.submitted_transfers && !source_count);
+		dispose_device(&s);
+	}
+}
 int main(void)
 {
 	uint8_t code;
@@ -349,6 +390,7 @@ int main(void)
 	reset_mock(); test_device_open();
 	reset_mock(); test_interface_lifetime();
 	reset_mock(); test_probes_and_cross(); reset_mock(); test_arm(); reset_mock(); test_start_lifetime();
-	puts("DSLogic native: control-protocol open/retry, WinUSB policy/claim cleanup, cross fragmentation/32-bit sparse tails, probes, arm/ext32, repeated acquisition and failed-start drain PASS");
+	test_long_header_wait();
+	puts("DSLogic native: control-protocol open/retry, WinUSB policy/claim cleanup, cross fragmentation/32-bit sparse tails, probes, arm/ext32, repeated acquisition, long header wait and failed-start drain PASS");
 	return 0;
 }
