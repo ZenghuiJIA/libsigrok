@@ -14,6 +14,9 @@ static int headers, ends, triggers, source_count, reentrant_start;
 static uint8_t bulk[2][512], result[8192];
 static size_t bulk_len[2], result_samples;
 static struct dsl_logic_decoder result_decoder;
+static int mock_discovery, mock_version_error, mock_version_major;
+static int mock_descriptor_error, mock_opens, mock_closes, mock_version_reads;
+static int mock_claims, mock_claim_error, mock_raw_policy, mock_hw_error;
 
 int sr_log(int level, const char *format, ...) { (void)level; (void)format; return SR_OK; }
 const char * LIBUSB_CALL libusb_error_name(int error) { (void)error; return "mock"; }
@@ -61,9 +64,31 @@ int command_ctl_wr(libusb_device_handle *h, struct ctl_wr_cmd cmd)
 	return SR_OK;
 }
 int command_ctl_rd(libusb_device_handle *h, struct ctl_rd_cmd cmd)
-{ (void)h; memset(cmd.data, 0, cmd.header.size); cmd.data[0] = bmSYS_CLR | bmGPIF_DONE; return SR_OK; }
+{
+	(void)h;
+	if (cmd.header.dest == DSL_CTL_FW_VERSION) {
+		assert(mock_discovery && cmd.header.offset == 0 && cmd.header.size == 2);
+		mock_version_reads++;
+		if (mock_version_error) return SR_ERR;
+		cmd.data[0] = mock_version_major; cmd.data[1] = 7;
+		return SR_OK;
+	}
+	memset(cmd.data, 0, cmd.header.size);
+	if (mock_discovery && cmd.header.dest == DSL_CTL_HW_STATUS) {
+		if (mock_hw_error) return SR_ERR;
+		cmd.data[0] = bmFPGA_DONE;
+		return SR_OK;
+	}
+	if (mock_discovery && cmd.header.dest == DSL_CTL_I2C_STATUS &&
+		cmd.header.size == HDL_VERSION_ADDR + 1) {
+		cmd.data[HDL_VERSION_ADDR] = DSL_HDL_VERSION;
+		return SR_OK;
+	}
+	cmd.data[0] = bmSYS_CLR | bmGPIF_DONE;
+	return SR_OK;
+}
 int LIBUSB_CALL libusb_release_interface(libusb_device_handle *h, int i) { (void)h; (void)i; return 0; }
-void LIBUSB_CALL libusb_close(libusb_device_handle *h) { (void)h; }
+void LIBUSB_CALL libusb_close(libusb_device_handle *h) { (void)h; mock_closes++; }
 int sr_resource_open(struct sr_context *c, struct sr_resource *r, int type, const char *name)
 { (void)c; (void)r; (void)type; (void)name; return SR_ERR; }
 int sr_resource_close(struct sr_context *c, struct sr_resource *r) { (void)c; (void)r; return SR_OK; }
@@ -120,21 +145,44 @@ int sr_analog_init(struct sr_datafeed_analog *a, struct sr_analog_encoding *e,
 	struct sr_analog_meaning *m, struct sr_analog_spec *s, int digits)
 { (void)digits; memset(a, 0, sizeof(*a)); a->encoding=e; a->meaning=m; a->spec=s; return SR_OK; }
 
-/* Discovery/open are deliberately unavailable: this binary cannot touch USB. */
-ssize_t LIBUSB_CALL libusb_get_device_list(libusb_context *c, libusb_device ***l) { (void)c; (void)l; return -1; }
-int LIBUSB_CALL libusb_get_device_descriptor(libusb_device *d, struct libusb_device_descriptor *v) { (void)d; (void)v; return -1; }
-int LIBUSB_CALL libusb_open(libusb_device *d, libusb_device_handle **h) { (void)d; (void)h; return -1; }
+/* Fake discovery is enabled only by the open tests; no real USB is linked. */
+ssize_t LIBUSB_CALL libusb_get_device_list(libusb_context *c, libusb_device ***l)
+{
+	static libusb_device *devices[] = {(void *)2, NULL};
+	(void)c; if (!mock_discovery) return -1; *l = devices; return 1;
+}
+int LIBUSB_CALL libusb_get_device_descriptor(libusb_device *d, struct libusb_device_descriptor *v)
+{
+	const struct dev_context *ctx = active->priv;
+	(void)d; if (mock_descriptor_error) return LIBUSB_ERROR_IO;
+	memset(v, 0, sizeof(*v)); v->idVendor = ctx->profile->vid; v->idProduct = ctx->profile->pid;
+	return 0;
+}
+int LIBUSB_CALL libusb_open(libusb_device *d, libusb_device_handle **h)
+{ (void)d; assert(mock_discovery); mock_opens++; mock_raw_policy=1; *h = (void *)1; return 0; }
 void LIBUSB_CALL libusb_free_device_list(libusb_device **l,int u) { (void)l; (void)u; }
 int LIBUSB_CALL libusb_has_capability(uint32_t c) { (void)c; return 0; }
 int LIBUSB_CALL libusb_kernel_driver_active(libusb_device_handle *h,int i) { (void)h; (void)i; return 0; }
 int LIBUSB_CALL libusb_detach_kernel_driver(libusb_device_handle *h,int i) { (void)h; (void)i; return -1; }
 uint8_t LIBUSB_CALL libusb_get_device_address(libusb_device *d) { (void)d; return 0; }
-int LIBUSB_CALL libusb_claim_interface(libusb_device_handle *h,int i) { (void)h; (void)i; return -1; }
+#ifdef HAVE_LIBUSB_OS_HANDLE
+int LIBUSB_CALL libusb_set_raw_io_default(libusb_device_handle *h, int enabled)
+{ (void)h; mock_raw_policy=enabled; return 0; }
+#endif
+int LIBUSB_CALL libusb_claim_interface(libusb_device_handle *h,int i)
+{
+	(void)h; (void)i;
+#ifdef HAVE_LIBUSB_OS_HANDLE
+	assert(mock_raw_policy == 0);
+#endif
+	mock_claims++; return mock_claim_error;
+}
 int LIBUSB_CALL libusb_get_string_descriptor_ascii(libusb_device_handle *h,uint8_t i,unsigned char *b,int n)
 { (void)h; (void)i; (void)b; (void)n; return -1; }
 int LIBUSB_CALL libusb_control_transfer(libusb_device_handle *h,uint8_t a,uint8_t b,uint16_t c,uint16_t d,unsigned char *e,uint16_t f,unsigned int g)
 { (void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g; return -1; }
-int usb_get_port_path(libusb_device *d, char *p, int n) { (void)d; (void)p; (void)n; return -1; }
+int usb_get_port_path(libusb_device *d, char *p, int n)
+{ (void)d; return g_snprintf(p, n, "usb/1-6"); }
 void sr_usb_dev_inst_free(struct sr_usb_dev_inst *u) { g_free(u); }
 void sr_dev_inst_free(struct sr_dev_inst *s) { (void)s; assert(0); }
 
@@ -143,6 +191,10 @@ static void reset_mock(void)
 	memset(queued, 0, sizeof(queued)); submits=fail_submit=writes=fail_write=bulk_count=short_bulk=0;
 	headers=ends=triggers=source_count=reentrant_start=0; result_samples=0;
 	memset(&result_decoder, 0, sizeof(result_decoder)); test_trigger=NULL;
+	mock_discovery=mock_version_error=mock_descriptor_error=0;
+	mock_opens=mock_closes=mock_version_reads=0;
+	mock_claims=mock_hw_error=0; mock_claim_error=-1; mock_raw_policy=1;
+	mock_version_major=DSL_REQUIRED_VERSION_MAJOR;
 }
 static void init_device(struct sr_dev_inst *s, struct dev_context *d, struct sr_usb_dev_inst *u)
 {
@@ -166,6 +218,59 @@ static void dispose_device(struct sr_dev_inst *s)
 	g_slist_free(s->channels);
 	for(l=s->channel_groups;l;l=l->next) { struct sr_channel_group *g=l->data; g_slist_free(g->channels); g_free(g->name); g_free(g); }
 	g_slist_free(s->channel_groups);
+}
+static void test_device_open(void)
+{
+	struct sr_dev_inst s; struct dev_context d; struct sr_usb_dev_inst u;
+	struct sr_context ctx = {0}; struct drv_context drvc = {0};
+	struct sr_dev_driver driver = {0};
+	init_device(&s, &d, &u);
+	drvc.sr_ctx = &ctx; driver.context = &drvc; s.driver = &driver;
+	s.connection_id = "usb/1-6"; s.status = SR_ST_INACTIVE; u.devhdl = NULL;
+	mock_discovery = 1;
+	assert(dslogic_dev_open(&s, &driver) == SR_OK);
+	assert(mock_opens == 1 && mock_version_reads == 1 && u.devhdl);
+	/* An already open device must not leak another handle. */
+	assert(dslogic_dev_open(&s, &driver) == SR_OK && mock_opens == 1);
+	dsl_release_handle(&s);
+	/* Failed version reads and incompatible firmware must release the handle
+	 * and permit the very next open to succeed. */
+	mock_version_error = 1;
+	assert(dslogic_dev_open(&s, &driver) == SR_ERR && !u.devhdl && mock_closes == 2);
+	mock_version_error = 0; mock_version_major = 1;
+	assert(dslogic_dev_open(&s, &driver) == SR_ERR && !u.devhdl && mock_closes == 3);
+	mock_version_major = DSL_REQUIRED_VERSION_MAJOR;
+	assert(dslogic_dev_open(&s, &driver) == SR_OK && mock_opens == 4);
+	dsl_release_handle(&s);
+	/* A stale active instance still selects by physical port, never VID/PID alone. */
+	s.status = SR_ST_ACTIVE; s.connection_id = "usb/1-7";
+	assert(dslogic_dev_open(&s, &driver) == SR_ERR && !u.devhdl && mock_opens == 4);
+	s.connection_id = "usb/1-6"; mock_descriptor_error = 1;
+	assert(dslogic_dev_open(&s, &driver) == SR_ERR && !u.devhdl && mock_opens == 4);
+	mock_discovery = 0;
+	dispose_device(&s);
+}
+static void test_interface_lifetime(void)
+{
+	struct sr_dev_inst s; struct dev_context d; struct sr_usb_dev_inst u;
+	struct sr_context ctx={0}; struct drv_context dc={0}; struct sr_dev_driver driver={0};
+	gboolean fpga_done=FALSE;
+	init_device(&s,&d,&u); dc.sr_ctx=&ctx; driver.context=&dc; s.driver=&driver;
+	s.connection_id="usb/1-6"; s.status=SR_ST_INACTIVE; u.devhdl=NULL;
+	mock_discovery=1;
+	/* An occupied interface must close its handle so the next attempt works. */
+	assert(dsl_dev_open(&driver,&s,&fpga_done)!=SR_OK);
+	assert(!u.devhdl && mock_claims==1 && mock_closes==1);
+	mock_claim_error=0;
+	/* Fail after claim, then reopen without poisoning the interface. */
+	mock_hw_error=1;
+	assert(dsl_dev_open(&driver,&s,&fpga_done)!=SR_OK);
+	assert(!u.devhdl && mock_claims==2 && mock_closes==2);
+	mock_hw_error=0;
+	assert(dsl_dev_open(&driver,&s,&fpga_done)==SR_OK && fpga_done);
+	assert(u.devhdl && mock_claims==3 && mock_opens==3);
+	assert(dsl_dev_close(&s)==SR_OK && !u.devhdl && mock_closes==3);
+	dispose_device(&s);
 }
 static void test_probes_and_cross(void)
 {
@@ -241,7 +346,9 @@ int main(void)
 	assert(!dsl_threshold_code(NAN,0,&code)); assert(!dsl_threshold_code(5.1,0,&code));
 	assert(dsl_trigger_replicate(0xfff2,1,0)==0x2222);
 	assert(dsl_trigger_replicate(0xff81,0,1)==0x8181);
+	reset_mock(); test_device_open();
+	reset_mock(); test_interface_lifetime();
 	reset_mock(); test_probes_and_cross(); reset_mock(); test_arm(); reset_mock(); test_start_lifetime();
-	puts("DSLogic native: cross fragmentation/32-bit sparse tails, probes, arm/ext32, repeated acquisition and failed-start drain PASS");
+	puts("DSLogic native: control-protocol open/retry, WinUSB policy/claim cleanup, cross fragmentation/32-bit sparse tails, probes, arm/ext32, repeated acquisition and failed-start drain PASS");
 	return 0;
 }

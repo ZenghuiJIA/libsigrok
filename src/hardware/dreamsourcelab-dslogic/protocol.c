@@ -30,8 +30,6 @@
  * These are the raw bRequest values sent via libusb_control_transfer.
  * They do not conflict with command.h (which defines CMD_CTL_WR/RD_PRE/RD
  * and the DSL_CTL_* enum used by the newer command_ctl_wr/rd wrappers). */
-#define DS_CMD_GET_FW_VERSION		0xb0
-#define DS_CMD_GET_REVID_VERSION	0xb1
 #define DS_CMD_START			0xb2
 #define DS_CMD_CONFIG			0xb3
 #define DS_CMD_SETTING			0xb4
@@ -152,37 +150,16 @@ struct cmd_start_acquisition {
 static int command_get_fw_version(libusb_device_handle *devhdl,
 				  struct version_info *vi)
 {
-	int ret;
+	struct ctl_rd_cmd cmd = {0};
 
-	ret = libusb_control_transfer(devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-		LIBUSB_ENDPOINT_IN, DS_CMD_GET_FW_VERSION, 0x0000, 0x0000,
-		(unsigned char *)vi, sizeof(struct version_info), USB_TIMEOUT);
-
-	if (ret < 0) {
-		sr_err("Unable to get version info: %s.",
-		       libusb_error_name(ret));
-		return SR_ERR;
-	}
-
-	return SR_OK;
-}
-
-static int command_get_revid_version(struct sr_dev_inst *sdi, uint8_t *revid)
-{
-	struct sr_usb_dev_inst *usb = sdi->conn;
-	libusb_device_handle *devhdl = usb->devhdl;
-	int ret;
-
-	ret = libusb_control_transfer(devhdl, LIBUSB_REQUEST_TYPE_VENDOR |
-		LIBUSB_ENDPOINT_IN, DS_CMD_GET_REVID_VERSION, 0x0000, 0x0000,
-		revid, 1, USB_TIMEOUT);
-
-	if (ret < 0) {
-		sr_err("Unable to get REVID: %s.", libusb_error_name(ret));
-		return SR_ERR;
-	}
-
-	return SR_OK;
+	/* All profiles in this driver use the DSL control protocol. The old
+	 * 0xb0 IN request is not a version query on these devices (0xb0 is
+	 * CMD_CTL_WR). In particular, never issue FX2-only REVID probes to U3
+	 * controllers. Match DSView's DSL_CTL_FW_VERSION read instead. */
+	cmd.header.dest = DSL_CTL_FW_VERSION;
+	cmd.header.size = sizeof(*vi);
+	cmd.data = (unsigned char *)vi;
+	return command_ctl_rd(devhdl, cmd);
 }
 
 static int command_start_acquisition(const struct sr_dev_inst *sdi)
@@ -1344,14 +1321,15 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 	struct libusb_device_descriptor des;
 	struct dev_context *devc;
 	struct drv_context *drvc;
-	struct version_info vi;
+	struct version_info vi = {0};
 	int ret = SR_ERR, i, device_count;
-	uint8_t revid;
-	char connection_id[64];
+	char connection_id[64] = {0};
 
 	drvc = di->context;
 	devc = sdi->priv;
 	usb = sdi->conn;
+	if (usb->devhdl)
+		return SR_OK;
 
 	device_count = libusb_get_device_list(drvc->sr_ctx->libusb_ctx, &devlist);
 	if (device_count < 0) {
@@ -1361,22 +1339,19 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 	}
 
 	for (i = 0; i < device_count; i++) {
-		libusb_get_device_descriptor(devlist[i], &des);
+		if (libusb_get_device_descriptor(devlist[i], &des) != LIBUSB_SUCCESS)
+			continue;
 
 		if (des.idVendor != devc->profile->vid
 		    || des.idProduct != devc->profile->pid)
 			continue;
 
-		if ((sdi->status == SR_ST_INITIALIZING) ||
-				(sdi->status == SR_ST_INACTIVE)) {
-			/* Check device by its physical USB bus/port address. */
-			if (usb_get_port_path(devlist[i], connection_id, sizeof(connection_id)) < 0)
-				continue;
-
-			if (strcmp(sdi->connection_id, connection_id))
-				/* This is not the one. */
-				continue;
-		}
+		/* Match the physical port even when reopening an active instance.
+		 * VID/PID alone cannot distinguish two analyzers of the same model. */
+		if (usb_get_port_path(devlist[i], connection_id, sizeof(connection_id)) < 0)
+			continue;
+		if (!sdi->connection_id || strcmp(sdi->connection_id, connection_id))
+			continue;
 
 		if (!(ret = libusb_open(devlist[i], &usb->devhdl))) {
 			if (usb->address == 0xff)
@@ -1409,12 +1384,6 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 			break;
 		}
 
-		ret = command_get_revid_version(sdi, &revid);
-		if (ret != SR_OK) {
-			sr_err("Failed to get REVID.");
-			break;
-		}
-
 		/*
 		 * Changes in major version mean incompatible/API changes, so
 		 * bail out if we encounter an incompatible version.
@@ -1433,15 +1402,16 @@ SR_PRIV int dslogic_dev_open(struct sr_dev_inst *sdi, struct sr_dev_driver *di)
 			usb->bus, usb->address, connection_id,
 			USB_INTERFACE, vi.major, vi.minor);
 
-		sr_info("Detected REVID=%d, it's a Cypress CY7C68013%s.",
-			revid, (revid != 1) ? " (FX2)" : "A (FX2LP)");
-
 		ret = SR_OK;
 
 		break;
 	}
 
 	libusb_free_device_list(devlist, 1);
+	if (ret != SR_OK && usb->devhdl) {
+		libusb_close(usb->devhdl);
+		usb->devhdl = NULL;
+	}
 
 	return ret;
 }
@@ -3263,6 +3233,16 @@ SR_PRIV int dsl_dev_open(struct sr_dev_driver *di, struct sr_dev_inst *sdi, gboo
 		sr_err("dsl_dev_open: Unable to open device.");
 		return SR_ERR;
 	}
+
+#ifdef HAVE_LIBUSB_OS_HANDLE
+	/* The bundled WinUSB backend defaults to RAW_IO. DSLogic's transfer
+	 * sizes depend on the enabled channel count and sample rate: sparse
+	 * captures need not be USB-packet aligned, and fast streams can exceed
+	 * WinUSB's RAW_IO maximum transfer size. Let WinUSB split/queue these
+	 * reads normally. Set the policy before claim (as the PX driver does),
+	 * since changing it on an already configured pipe is unreliable. */
+	libusb_set_raw_io_default(usb->devhdl, 0);
+#endif
 
 	ret = libusb_claim_interface(usb->devhdl, USB_INTERFACE);
 	if (ret != LIBUSB_SUCCESS) {
